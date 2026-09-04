@@ -120,6 +120,18 @@ dist\Connection Check\
 
 When distributing the `--onedir` build, keep the whole folder together.
 
+## Official Releases and Third-Party Builds
+
+Official Connection Check releases are published by **G-SOFTWARE** through this repository:
+
+https://github.com/AltusParati/Connection_Check
+
+Modified versions, forks, repackaged copies, or third-party builds are **not official G-SOFTWARE releases** unless explicitly stated otherwise by G-SOFTWARE.
+
+Any modifications made and distributed by third parties are the responsibility of their respective authors and distributors.
+
+For the full project notice, see [`NOTICE.md`](NOTICE.md).
+
 ## Privacy
 
 Connection Check does not need a user account and its outage logs are stored locally on the user's computer.
