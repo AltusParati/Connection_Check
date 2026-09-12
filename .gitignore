@@ -35,3 +35,6 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local release builds
+release/

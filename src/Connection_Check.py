@@ -4,6 +4,11 @@ import json
 import shutil
 import socket
 import threading
+import struct
+import time
+import statistics
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import winreg
 import ctypes
 from ctypes import wintypes
@@ -22,7 +27,7 @@ import pystray
 # ============================================================
 
 APP_NAME = "Connection Check"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 KONTROL_ARALIGI = 2
 BASARISIZLIK_LIMITI = 3
@@ -32,6 +37,27 @@ SUNUCULAR = [
     ("8.8.8.8", 53),   # Google DNS
     ("9.9.9.9", 53),   # Quad9
 ]
+
+# Bağlantı kalitesi ölçümü ISS'den bağımsızdır.
+# Tek bir hedefe güvenmek yerine üç bağımsız internet hedefinde ortak
+# paket kaybı aranır. Varsayılan ağ geçidi ayrıca otomatik tespit edilir.
+KALITE_HEDEFLERI = {
+    "Cloudflare": "1.1.1.1",
+    "Google": "8.8.8.8",
+    "Quad9": "9.9.9.9",
+}
+
+KALITE_KONTROL_ARALIGI = 2
+KALITE_PENCERE_SANIYE = 60
+KALITE_MIN_ORNEK = 15
+KALITE_ICMP_TIMEOUT_MS = 900
+
+# En az iki bağımsız internet hedefinde bu eşik veya üzeri kayıp
+# görülürse bağlantı kararsız kabul edilir.
+KALITE_KAYIP_ALARM_YUZDE = 3.0
+KALITE_KAYIP_DUZELDI_YUZDE = 1.0
+KALITE_ALARM_ONAY_DONGUSU = 3
+KALITE_DUZELME_ONAY_DONGUSU = 3
 
 # G-SOFTWARE TARAFINDAN KODLANMIŞTIR. (www.g-software.org)
 # DEVELOPED BY G-SOFTWARE. (www.g-software.org)
@@ -160,6 +186,12 @@ DEFAULT_SETTINGS = {
     "close_to_tray": True,
     "start_with_windows": False,
     "language": "tr",
+
+    # Bağlantı kalitesi ölçümleri varsayılan olarak birlikte açıktır.
+    # İkisini birlikte kullanmak sorunun yerel ağda mı yoksa internet
+    # yönünde mi olduğunu ayırabilmek için önerilir.
+    "monitor_local_quality": True,
+    "monitor_internet_quality": True,
 }
 
 
@@ -224,6 +256,14 @@ TRANSLATIONS = {
         "close_to_tray_desc": "Pencere kapanır ancak bağlantı takibi arka planda devam eder.",
         "startup": "Bilgisayar açıldığında programı çalıştır ve takibe başla",
         "startup_desc": "Windows oturumu açıldığında Connection Check otomatik başlatılır.",
+
+        # Bağlantı kalitesi ayarları
+        "quality_settings_title": "Bağlantı Kalitesi İzleme",
+        "quality_settings_desc": "İki ölçümü birlikte kullanmak sorunun kaynağını ayırmak için önerilir.",
+        "monitor_local_quality": "Yerel ağdaki paket kaybını ölç",
+        "monitor_local_quality_desc": "Bilgisayar ile otomatik tespit edilen ağ geçidi arasını ölçer.",
+        "monitor_internet_quality": "İnternet / ISS yönündeki paket kaybını ölç",
+        "monitor_internet_quality_desc": "Cloudflare, Google ve Quad9 hedeflerini birlikte ölçer.",
         "cancel": "İptal",
         "save": "Kaydet",
         "startup_error_title": "Başlangıç Ayarı",
@@ -257,6 +297,56 @@ TRANSLATIONS = {
         # Tek örnek (single instance)
         "already_running_title": "Connection Check",
         "already_running_message": "Connection Check zaten açık.",
+
+        # Bağlantı kalitesi
+        "unstable": "●  Bağlantı Kararsız — Paket kaybı tespit edildi",
+        "quality_title": "BAĞLANTI KALİTESİ",
+        "quality_status_measuring": "●  Ölçülüyor...",
+        "quality_status_normal": "●  Normal",
+        "quality_status_unstable": "●  Kararsız — Paket kaybı tespit edildi",
+        "quality_status_unavailable": "●  Ölçüm kullanılamıyor",
+        "quality_status_paused": "●  Durduruldu",
+        "quality_status_disabled": "●  Kalite ölçümü kapalı",
+        "packet_loss": "Paket Kaybı",
+        "quality_local_scope": "Yerel ağ (Bilgisayar ↔ Ağ Geçidi)",
+        "quality_internet_scope": "İnternet / ISS yönü",
+        "quality_scope_disabled": "Kapalı",
+        "quality_scope_measuring": "Ölçülüyor...",
+        "quality_local_line": "Yerel ağ: {loss}  •  Ağ geçidi: {gateway}",
+        "quality_internet_line": "İnternet / ISS yönü: {loss}",
+        "ping": "Ping",
+        "jitter": "Jitter",
+        "quality_measuring": "Bağlantı kalitesi ölçülüyor...",
+        "quality_unavailable": "ICMP ölçümü için yeterli veri alınamadı.",
+        "quality_paused": "Bağlantı kalitesi takibi durduruldu.",
+        "quality_source_healthy": "Bağlantı kalitesi normal",
+        "quality_source_local": "Muhtemel kaynak: Yerel ağ / ağ geçidi tarafı",
+        "quality_source_isp": "Muhtemel kaynak: İnternet / ISS tarafı",
+        "quality_source_unknown": "Muhtemel kaynak: Belirlenemedi",
+        "quality_source_internet_only": "İnternet yönünde kayıp tespit edildi • Yerel ağ ölçümü kapalı",
+        "gateway_info": "Ağ geçidi: {gateway}  •  Kayıp: {loss}",
+        "gateway_unknown": "Ağ geçidi: Tespit edilemedi / ICMP yanıtı yok",
+        "quality_became_unstable": "Bağlantı kararsızlaştı: {time}",
+        "quality_became_stable": "Bağlantı normale döndü: {time}",
+
+        # Bağlantı kalitesi log metinleri
+        "log_quality_unstable": "BAĞLANTI KARARSIZLAŞTI",
+        "log_quality_stable": "BAĞLANTI NORMALE DÖNDÜ",
+        "log_packet_loss": "Paket kaybı",
+        "log_ping": "Ortalama ping",
+        "log_jitter": "Jitter",
+        "log_gateway_loss": "Ağ geçidi kaybı",
+        "log_likely_source": "Muhtemel kaynak",
+        "log_source_local": "Yerel ağ / ağ geçidi tarafı",
+        "log_source_isp": "İnternet / ISS tarafı",
+        "log_source_unknown": "Belirlenemedi",
+        "log_quality_duration": "Kararsızlık süresi",
+        "quality_log_title": "BAĞLANTI KALİTESİ KAYDI",
+        "quality_log_unstable_started": "KARARSIZLIK BAŞLADI",
+        "quality_log_normal_restored": "NORMALE DÖNDÜ",
+        "quality_log_targets": "Hedefler",
+        "quality_log_local": "Yerel ağ",
+        "quality_log_internet": "İnternet / ISS yönü",
     },
     "en": {
         "subtitle": "Monitors your internet connection in real time and keeps a daily outage log.",
@@ -286,6 +376,14 @@ TRANSLATIONS = {
         "close_to_tray_desc": "The window closes while connection monitoring continues in the background.",
         "startup": "Run the program and start monitoring when the computer starts",
         "startup_desc": "Connection Check starts automatically when you sign in to Windows.",
+
+        # Connection quality settings
+        "quality_settings_title": "Connection Quality Monitoring",
+        "quality_settings_desc": "Using both measurements is recommended to help identify where the problem begins.",
+        "monitor_local_quality": "Measure packet loss on the local network",
+        "monitor_local_quality_desc": "Measures between the computer and the automatically detected gateway.",
+        "monitor_internet_quality": "Measure packet loss toward the Internet / ISP",
+        "monitor_internet_quality_desc": "Measures Cloudflare, Google, and Quad9 together.",
         "cancel": "Cancel",
         "save": "Save",
         "startup_error_title": "Startup Setting",
@@ -319,6 +417,56 @@ TRANSLATIONS = {
         # Single instance
         "already_running_title": "Connection Check",
         "already_running_message": "Connection Check is already running.",
+
+        # Connection quality
+        "unstable": "●  Unstable Connection — Packet loss detected",
+        "quality_title": "CONNECTION QUALITY",
+        "quality_status_measuring": "●  Measuring...",
+        "quality_status_normal": "●  Normal",
+        "quality_status_unstable": "●  Unstable — Packet loss detected",
+        "quality_status_unavailable": "●  Measurement unavailable",
+        "quality_status_paused": "●  Paused",
+        "quality_status_disabled": "●  Quality monitoring disabled",
+        "packet_loss": "Packet Loss",
+        "quality_local_scope": "Local network (Computer ↔ Gateway)",
+        "quality_internet_scope": "Internet / ISP path",
+        "quality_scope_disabled": "Disabled",
+        "quality_scope_measuring": "Measuring...",
+        "quality_local_line": "Local network: {loss}  •  Gateway: {gateway}",
+        "quality_internet_line": "Internet / ISP path: {loss}",
+        "ping": "Ping",
+        "jitter": "Jitter",
+        "quality_measuring": "Measuring connection quality...",
+        "quality_unavailable": "Not enough data for ICMP quality measurement.",
+        "quality_paused": "Connection quality monitoring is paused.",
+        "quality_source_healthy": "Connection quality is normal",
+        "quality_source_local": "Likely source: Local network / gateway side",
+        "quality_source_isp": "Likely source: Internet / ISP side",
+        "quality_source_unknown": "Likely source: Undetermined",
+        "quality_source_internet_only": "Loss detected on the internet path • Local monitoring is disabled",
+        "gateway_info": "Gateway: {gateway}  •  Loss: {loss}",
+        "gateway_unknown": "Gateway: Not detected / no ICMP response",
+        "quality_became_unstable": "Connection became unstable: {time}",
+        "quality_became_stable": "Connection returned to normal: {time}",
+
+        # Connection quality log texts
+        "log_quality_unstable": "CONNECTION BECAME UNSTABLE",
+        "log_quality_stable": "CONNECTION RETURNED TO NORMAL",
+        "log_packet_loss": "Packet loss",
+        "log_ping": "Average ping",
+        "log_jitter": "Jitter",
+        "log_gateway_loss": "Gateway loss",
+        "log_likely_source": "Likely source",
+        "log_source_local": "Local network / gateway side",
+        "log_source_isp": "Internet / ISP side",
+        "log_source_unknown": "Undetermined",
+        "log_quality_duration": "Unstable duration",
+        "quality_log_title": "CONNECTION QUALITY LOG",
+        "quality_log_unstable_started": "INSTABILITY STARTED",
+        "quality_log_normal_restored": "RETURNED TO NORMAL",
+        "quality_log_targets": "Targets",
+        "quality_log_local": "Local network",
+        "quality_log_internet": "Internet / ISP path",
     },
 }
 
@@ -838,6 +986,10 @@ def dosya_hazirla(dt=None):
                 or "BAĞLANTI GELDİ" in temiz
                 or "CONNECTION LOST" in temiz
                 or "CONNECTION RESTORED" in temiz
+                or "BAĞLANTI KARARSIZLAŞTI" in temiz
+                or "BAĞLANTI NORMALE DÖNDÜ" in temiz
+                or "CONNECTION BECAME UNSTABLE" in temiz
+                or "CONNECTION RETURNED TO NORMAL" in temiz
             ):
                 olay_baslangici = i
                 break
@@ -877,6 +1029,102 @@ def kayit_yaz(metin, dt=None):
         dt = simdi()
 
     dosya = dosya_hazirla(dt)
+
+    with open(dosya, "a", encoding="utf-8") as f:
+        f.write(metin + "\n")
+
+
+def kalite_log_dosyasi(dt=None):
+    """
+    Paket kaybı / ping / jitter olaylarını ana internet kesinti logundan
+    ayrı tutar. Böylece günlük kesinti kaydı sade kalır.
+    """
+    if dt is None:
+        dt = simdi()
+
+    return os.path.join(
+        LOG_DIR,
+        f"{tarih_anahtari(dt)}-quality.txt"
+    )
+
+
+def kalite_dosya_hazirla(dt=None):
+    """
+    Günlük bağlantı kalitesi log dosyasını hazırlar.
+    Mevcut olaylara dokunmadan yalnızca üst bilgiyi aktif dile göre yeniler.
+    """
+    if dt is None:
+        dt = simdi()
+
+    dosya = kalite_log_dosyasi(dt)
+    dil = settings.get("language", "tr")
+
+    baslik = t_lang("quality_log_title", dil)
+    tarih_satiri = f'{t_lang("log_date_label", dil)}: {dt.strftime("%d/%m/%Y")}'
+    format_bilgisi = t_lang("log_date_format_info", dil)
+    ayirici = "=" * 72
+
+    if not os.path.exists(dosya):
+        with open(dosya, "w", encoding="utf-8") as f:
+            f.write(baslik + "\n")
+            f.write(tarih_satiri + "\n")
+            f.write(format_bilgisi + "\n")
+            f.write(ayirici + "\n\n")
+        return dosya
+
+    try:
+        with open(dosya, "r", encoding="utf-8") as f:
+            icerik = f.read()
+
+        satirlar = icerik.splitlines()
+        olay_baslangici = None
+
+        for i, satir in enumerate(satirlar):
+            temiz = satir.strip()
+
+            if (
+                "KARARSIZLIK BAŞLADI" in temiz
+                or "NORMALE DÖNDÜ" in temiz
+                or "INSTABILITY STARTED" in temiz
+                or "RETURNED TO NORMAL" in temiz
+            ):
+                olay_baslangici = i
+                break
+
+        olay_satirlari = (
+            []
+            if olay_baslangici is None
+            else satirlar[olay_baslangici:]
+        )
+
+        yeni_satirlar = [
+            baslik,
+            tarih_satiri,
+            format_bilgisi,
+            ayirici,
+            "",
+        ]
+
+        if olay_satirlari:
+            yeni_satirlar.extend(olay_satirlari)
+
+        yeni_icerik = "\n".join(yeni_satirlar).rstrip() + "\n"
+
+        if yeni_icerik != icerik:
+            with open(dosya, "w", encoding="utf-8") as f:
+                f.write(yeni_icerik)
+
+    except Exception:
+        pass
+
+    return dosya
+
+
+def kalite_kayit_yaz(metin, dt=None):
+    if dt is None:
+        dt = simdi()
+
+    dosya = kalite_dosya_hazirla(dt)
 
     with open(dosya, "a", encoding="utf-8") as f:
         f.write(metin + "\n")
@@ -957,6 +1205,185 @@ def internet_kontrol():
             continue
 
     return False
+
+
+# ============================================================
+# WINDOWS ICMP / BAĞLANTI KALİTESİ ALTYAPISI
+# ============================================================
+
+class MIB_IPFORWARDROW(ctypes.Structure):
+    _fields_ = [
+        ("dwForwardDest", wintypes.DWORD),
+        ("dwForwardMask", wintypes.DWORD),
+        ("dwForwardPolicy", wintypes.DWORD),
+        ("dwForwardNextHop", wintypes.DWORD),
+        ("dwForwardIfIndex", wintypes.DWORD),
+        ("dwForwardType", wintypes.DWORD),
+        ("dwForwardProto", wintypes.DWORD),
+        ("dwForwardAge", wintypes.DWORD),
+        ("dwForwardNextHopAS", wintypes.DWORD),
+        ("dwForwardMetric1", wintypes.DWORD),
+        ("dwForwardMetric2", wintypes.DWORD),
+        ("dwForwardMetric3", wintypes.DWORD),
+        ("dwForwardMetric4", wintypes.DWORD),
+        ("dwForwardMetric5", wintypes.DWORD),
+    ]
+
+
+class IP_OPTION_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("Ttl", ctypes.c_ubyte),
+        ("Tos", ctypes.c_ubyte),
+        ("Flags", ctypes.c_ubyte),
+        ("OptionsSize", ctypes.c_ubyte),
+        ("OptionsData", ctypes.c_void_p),
+    ]
+
+
+class ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [
+        ("Address", wintypes.DWORD),
+        ("Status", wintypes.DWORD),
+        ("RoundTripTime", wintypes.DWORD),
+        ("DataSize", wintypes.WORD),
+        ("Reserved", wintypes.WORD),
+        ("Data", ctypes.c_void_p),
+        ("Options", IP_OPTION_INFORMATION),
+    ]
+
+
+def _ipv4_dword(ip):
+    return struct.unpack("=I", socket.inet_aton(ip))[0]
+
+
+def _dword_ipv4(value):
+    return socket.inet_ntoa(struct.pack("=I", int(value)))
+
+
+def varsayilan_gateway_bul():
+    """
+    Windows IP Helper API ile o anda internete çıkmak için kullanılan
+    IPv4 varsayılan ağ geçidini otomatik tespit eder.
+
+    Böylece modem/gateway adresi hiçbir ISS veya kullanıcı için
+    sabit kodlanmaz.
+    """
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+        row = MIB_IPFORWARDROW()
+
+        get_best_route = iphlpapi.GetBestRoute
+        get_best_route.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(MIB_IPFORWARDROW),
+        ]
+        get_best_route.restype = wintypes.DWORD
+
+        sonuc = get_best_route(
+            _ipv4_dword("1.1.1.1"),
+            0,
+            ctypes.byref(row),
+        )
+
+        if sonuc != 0 or row.dwForwardNextHop == 0:
+            return None
+
+        gateway = _dword_ipv4(row.dwForwardNextHop)
+
+        if gateway == "0.0.0.0":
+            return None
+
+        return gateway
+
+    except Exception:
+        return None
+
+
+def icmp_ping(ip, timeout_ms=KALITE_ICMP_TIMEOUT_MS):
+    """
+    Windows IcmpSendEcho API kullanır.
+
+    ping.exe çıktısını parse etmediği için Windows arayüz dilinden bağımsızdır.
+    Yönetici yetkisi gerektirmez.
+
+    Dönüş:
+        (True, round_trip_ms)  -> ICMP yanıtı geldi
+        (False, None)         -> timeout / yanıt yok
+    """
+    handle = None
+
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+
+        icmp_create = iphlpapi.IcmpCreateFile
+        icmp_create.argtypes = []
+        icmp_create.restype = wintypes.HANDLE
+
+        icmp_send = iphlpapi.IcmpSendEcho
+        icmp_send.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.WORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        icmp_send.restype = wintypes.DWORD
+
+        icmp_close = iphlpapi.IcmpCloseHandle
+        icmp_close.argtypes = [wintypes.HANDLE]
+        icmp_close.restype = wintypes.BOOL
+
+        handle = icmp_create()
+
+        invalid_handle = ctypes.c_void_p(-1).value
+
+        if not handle or int(handle) == invalid_handle:
+            return False, None
+
+        payload = b"ConnectionCheck"
+        request = ctypes.create_string_buffer(payload)
+
+        reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + len(payload) + 32
+        reply_buffer = ctypes.create_string_buffer(reply_size)
+
+        cevap_sayisi = icmp_send(
+            handle,
+            _ipv4_dword(ip),
+            ctypes.cast(request, ctypes.c_void_p),
+            len(payload),
+            None,
+            ctypes.cast(reply_buffer, ctypes.c_void_p),
+            reply_size,
+            int(timeout_ms),
+        )
+
+        if cevap_sayisi <= 0:
+            return False, None
+
+        reply = ctypes.cast(
+            reply_buffer,
+            ctypes.POINTER(ICMP_ECHO_REPLY)
+        ).contents
+
+        # IP_SUCCESS
+        if reply.Status != 0:
+            return False, None
+
+        return True, float(reply.RoundTripTime)
+
+    except Exception:
+        return False, None
+
+    finally:
+        if handle:
+            try:
+                ctypes.windll.iphlpapi.IcmpCloseHandle(handle)
+            except Exception:
+                pass
 
 # G-SOFTWARE TARAFINDAN KODLANMIŞTIR. (www.g-software.org)
 # DEVELOPED BY G-SOFTWARE. (www.g-software.org)
@@ -1057,6 +1484,38 @@ takip_anahtari = "starting"
 son_olay_turu = None
 son_olay_degeri = "-"
 
+# Bağlantı kalitesi thread/state
+kalite_thread = None
+kalite_stop_event = None
+kalite_lock = threading.RLock()
+
+kalite_gateway = None
+kalite_gecmisi = {}
+kalite_durumu = "warming"
+kalite_alarm_sayaci = 0
+kalite_duzelme_sayaci = 0
+kalite_unstable_baslangici = None
+kalite_unstable_kaynagi = "unknown"
+
+kalite_son_metrikler = {
+    "mode": "warming",
+    "loss": None,
+    "ping": None,
+    "jitter": None,
+    "source": "unknown",
+    "gateway": None,
+    "gateway_loss": None,
+    "local_enabled": True,
+    "internet_enabled": True,
+    "local_loss": None,
+    "local_ping": None,
+    "local_jitter": None,
+    "internet_loss": None,
+    "internet_ping": None,
+    "internet_jitter": None,
+    "targets": {},
+}
+
 # G-SOFTWARE TARAFINDAN KODLANMIŞTIR. (www.g-software.org)
 # DEVELOPED BY G-SOFTWARE. (www.g-software.org)
 # ============================================================
@@ -1067,6 +1526,14 @@ durum_var = tk.StringVar(value="")
 son_islem_var = tk.StringVar(value="-")
 kesinti_var = tk.StringVar(value="0")
 takip_var = tk.StringVar(value="")
+
+kalite_status_var = tk.StringVar(value="")
+kalite_loss_var = tk.StringVar(value="—")
+kalite_ping_var = tk.StringVar(value="—")
+kalite_jitter_var = tk.StringVar(value="—")
+kalite_source_var = tk.StringVar(value="")
+kalite_gateway_var = tk.StringVar(value="")
+kalite_internet_var = tk.StringVar(value="")
 
 # G-SOFTWARE TARAFINDAN KODLANMIŞTIR. (www.g-software.org)
 # DEVELOPED BY G-SOFTWARE. (www.g-software.org)
@@ -1143,6 +1610,987 @@ def son_islem_ayarla(tur, deger):
 
 def kesinti_sayisi_guncelle(sayi):
     kesinti_var.set(str(sayi))
+
+
+def kalite_render():
+    """
+    Yerel ağ ve internet/ISS yönü ölçümlerini ayrı ayrı gösterir.
+    Kullanıcı Ayarlar'dan iki ölçümü bağımsız olarak açıp kapatabilir.
+    """
+    metrik = kalite_son_metrikler.copy()
+    mode = metrik.get("mode", "warming")
+
+    local_enabled = bool(
+        metrik.get(
+            "local_enabled",
+            settings.get("monitor_local_quality", True)
+        )
+    )
+    internet_enabled = bool(
+        metrik.get(
+            "internet_enabled",
+            settings.get("monitor_internet_quality", True)
+        )
+    )
+
+    gateway = metrik.get("gateway")
+    local_loss = metrik.get("local_loss")
+    internet_loss = metrik.get("internet_loss")
+
+    # Yerel ağ satırı
+    if not local_enabled:
+        kalite_gateway_var.set(
+            f"{t('quality_local_scope')}: {t('quality_scope_disabled')}"
+        )
+    elif gateway and local_loss is not None:
+        kalite_gateway_var.set(
+            t("quality_local_line").format(
+                loss=f"{local_loss:.1f}%",
+                gateway=gateway
+            )
+        )
+    elif gateway:
+        kalite_gateway_var.set(
+            t("quality_local_line").format(
+                loss=t("quality_scope_measuring"),
+                gateway=gateway
+            )
+        )
+    else:
+        kalite_gateway_var.set(
+            f"{t('quality_local_scope')}: {t('quality_scope_measuring')}"
+        )
+
+    # İnternet / ISS satırı
+    if not internet_enabled:
+        kalite_internet_var.set(
+            f"{t('quality_internet_scope')}: {t('quality_scope_disabled')}"
+        )
+    elif internet_loss is not None:
+        kalite_internet_var.set(
+            t("quality_internet_line").format(
+                loss=f"{internet_loss:.1f}%"
+            )
+        )
+    else:
+        kalite_internet_var.set(
+            t("quality_internet_line").format(
+                loss=t("quality_scope_measuring")
+            )
+        )
+
+    if mode == "disabled":
+        kalite_status_var.set(t("quality_status_disabled"))
+        kalite_loss_var.set("—")
+        kalite_ping_var.set("—")
+        kalite_jitter_var.set("—")
+        kalite_source_var.set("")
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=TEXT_MUTED)
+        return
+
+    if mode == "paused":
+        kalite_status_var.set(t("quality_status_paused"))
+        kalite_loss_var.set("—")
+        kalite_ping_var.set("—")
+        kalite_jitter_var.set("—")
+        kalite_source_var.set(t("quality_paused"))
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=TEXT_MUTED)
+        return
+
+    if mode == "warming":
+        kalite_status_var.set(t("quality_status_measuring"))
+        kalite_loss_var.set("—")
+        kalite_ping_var.set("—")
+        kalite_jitter_var.set("—")
+        kalite_source_var.set(t("quality_measuring"))
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=ACCENT_BLUE)
+        return
+
+    if mode == "unavailable":
+        kalite_status_var.set(t("quality_status_unavailable"))
+        kalite_loss_var.set("—")
+        kalite_ping_var.set("—")
+        kalite_jitter_var.set("—")
+        kalite_source_var.set(t("quality_unavailable"))
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=TEXT_MUTED)
+        return
+
+    # Üstteki büyük Packet Loss / Ping / Jitter değerleri:
+    # İnternet ölçümü açıksa onu gösterir; yalnız yerel ölçüm açıksa
+    # yerel metrikleri gösterir.
+    if internet_enabled and metrik.get("internet_loss") is not None:
+        loss = metrik.get("internet_loss")
+        ping = metrik.get("internet_ping")
+        jitter = metrik.get("internet_jitter")
+    else:
+        loss = metrik.get("local_loss")
+        ping = metrik.get("local_ping")
+        jitter = metrik.get("local_jitter")
+
+    kalite_loss_var.set(
+        "—" if loss is None else f"{loss:.1f}%"
+    )
+    kalite_ping_var.set(
+        "—" if ping is None else f"{ping:.0f} ms"
+    )
+    kalite_jitter_var.set(
+        "—" if jitter is None else f"{jitter:.1f} ms"
+    )
+
+    if kalite_durumu == "unstable":
+        kalite_status_var.set(t("quality_status_unstable"))
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=ACCENT_AMBER)
+    else:
+        kalite_status_var.set(t("quality_status_normal"))
+
+        if "quality_status_label" in globals():
+            quality_status_label.config(fg=ACCENT)
+
+    source = metrik.get("source", "unknown")
+
+    if kalite_durumu != "unstable":
+        kalite_source_var.set(t("quality_source_healthy"))
+    elif source == "local":
+        kalite_source_var.set(t("quality_source_local"))
+    elif source == "isp":
+        kalite_source_var.set(t("quality_source_isp"))
+    elif source == "internet_only":
+        kalite_source_var.set(t("quality_source_internet_only"))
+    else:
+        kalite_source_var.set(t("quality_source_unknown"))
+
+
+def kalite_metriklerini_guiye_uygula(metrik):
+    global kalite_son_metrikler
+    kalite_son_metrikler = dict(metrik)
+    kalite_render()
+
+
+def kalite_ana_durumu_guiye_uygula(anahtar):
+    """
+    Bağlantı kalitesi artık ana BAĞLANTI DURUMU alanını değiştirmez.
+    Ana alan yalnızca gerçek internet erişimini gösterir.
+    """
+    return
+
+
+def kalite_gecmisini_sifirla(mode="warming"):
+    global kalite_gecmisi
+    global kalite_durumu
+    global kalite_alarm_sayaci
+    global kalite_duzelme_sayaci
+    global kalite_unstable_baslangici
+    global kalite_unstable_kaynagi
+    global kalite_son_metrikler
+
+    with kalite_lock:
+        kalite_gecmisi = {}
+        kalite_durumu = "warming" if mode != "paused" else "paused"
+        kalite_alarm_sayaci = 0
+        kalite_duzelme_sayaci = 0
+        kalite_unstable_baslangici = None
+        kalite_unstable_kaynagi = "unknown"
+
+        local_enabled = settings.get(
+            "monitor_local_quality",
+            True
+        )
+        internet_enabled = settings.get(
+            "monitor_internet_quality",
+            True
+        )
+
+        gercek_mode = mode
+
+        if (
+            mode != "paused"
+            and not local_enabled
+            and not internet_enabled
+        ):
+            gercek_mode = "disabled"
+
+        kalite_son_metrikler = {
+            "mode": gercek_mode,
+            "loss": None,
+            "ping": None,
+            "jitter": None,
+            "source": "unknown",
+            "gateway": kalite_gateway,
+            "gateway_loss": None,
+            "local_enabled": local_enabled,
+            "internet_enabled": internet_enabled,
+            "local_loss": None,
+            "local_ping": None,
+            "local_jitter": None,
+            "internet_loss": None,
+            "internet_ping": None,
+            "internet_jitter": None,
+            "targets": {},
+        }
+
+    gui_cagir(kalite_render)
+
+
+def kalite_ornek_ekle(ip, basarili, rtt_ms, monotonic_now):
+    with kalite_lock:
+        history = kalite_gecmisi.setdefault(ip, deque())
+        history.append((monotonic_now, bool(basarili), rtt_ms))
+
+        sinir = monotonic_now - KALITE_PENCERE_SANIYE
+
+        while history and history[0][0] < sinir:
+            history.popleft()
+
+
+def kalite_hedef_metrigi(ip, monotonic_now):
+    with kalite_lock:
+        history = list(kalite_gecmisi.get(ip, ()))
+
+    sinir = monotonic_now - KALITE_PENCERE_SANIYE
+    history = [item for item in history if item[0] >= sinir]
+
+    sent = len(history)
+    successful = [item for item in history if item[1]]
+    success_count = len(successful)
+    lost = sent - success_count
+
+    loss = None
+    avg_rtt = None
+    jitter = None
+
+    if sent:
+        loss = (lost / sent) * 100.0
+
+    rtts = [
+        float(item[2])
+        for item in successful
+        if item[2] is not None
+    ]
+
+    if rtts:
+        avg_rtt = statistics.fmean(rtts)
+
+    if len(rtts) >= 2:
+        diffs = [
+            abs(rtts[i] - rtts[i - 1])
+            for i in range(1, len(rtts))
+        ]
+        jitter = statistics.fmean(diffs)
+
+    return {
+        "sent": sent,
+        "success": success_count,
+        "lost": lost,
+        "loss": loss,
+        "ping": avg_rtt,
+        "jitter": jitter,
+    }
+
+
+def kalite_log_kaynagi(source, language):
+    if source == "local":
+        return t_lang("log_source_local", language)
+    if source == "isp":
+        return t_lang("log_source_isp", language)
+    if source == "internet_only":
+        return t_lang("quality_source_internet_only", language)
+    return t_lang("log_source_unknown", language)
+
+
+def kalite_olayi_yaz(olay, metrik, dt, baslangic=None):
+    """
+    Kalite olaylarını ana kesinti logundan ayrı ve kapsam bazlı yazar.
+    """
+    dil = settings.get("language", "tr")
+
+    if olay == "unstable":
+        baslik = t_lang(
+            "quality_log_unstable_started",
+            dil
+        )
+    else:
+        baslik = t_lang(
+            "quality_log_normal_restored",
+            dil
+        )
+
+    satirlar = [
+        f"[{baslik}]  {zaman_yaz(dt)}"
+    ]
+
+    local_enabled = metrik.get(
+        "local_enabled",
+        True
+    )
+    internet_enabled = metrik.get(
+        "internet_enabled",
+        True
+    )
+
+    if local_enabled:
+        gateway = metrik.get("gateway") or "?"
+        local_loss = metrik.get("local_loss")
+        local_ping = metrik.get("local_ping")
+        local_jitter = metrik.get("local_jitter")
+
+        local_parts = []
+
+        if local_loss is not None:
+            local_parts.append(
+                f"{t_lang('log_packet_loss', dil)}: "
+                f"{local_loss:.1f}%"
+            )
+
+        if local_ping is not None:
+            local_parts.append(
+                f"{t_lang('log_ping', dil)}: "
+                f"{local_ping:.0f} ms"
+            )
+
+        if local_jitter is not None:
+            local_parts.append(
+                f"{t_lang('log_jitter', dil)}: "
+                f"{local_jitter:.1f} ms"
+            )
+
+        local_text = (
+            "  |  ".join(local_parts)
+            if local_parts
+            else t_lang("quality_scope_measuring", dil)
+        )
+
+        satirlar.append(
+            f"  {t_lang('quality_log_local', dil)} "
+            f"({gateway}): {local_text}"
+        )
+
+    if internet_enabled:
+        internet_loss = metrik.get("internet_loss")
+        internet_ping = metrik.get("internet_ping")
+        internet_jitter = metrik.get("internet_jitter")
+
+        internet_parts = []
+
+        if internet_loss is not None:
+            internet_parts.append(
+                f"{t_lang('log_packet_loss', dil)}: "
+                f"{internet_loss:.1f}%"
+            )
+
+        if internet_ping is not None:
+            internet_parts.append(
+                f"{t_lang('log_ping', dil)}: "
+                f"{internet_ping:.0f} ms"
+            )
+
+        if internet_jitter is not None:
+            internet_parts.append(
+                f"{t_lang('log_jitter', dil)}: "
+                f"{internet_jitter:.1f} ms"
+            )
+
+        internet_text = (
+            "  |  ".join(internet_parts)
+            if internet_parts
+            else t_lang("quality_scope_measuring", dil)
+        )
+
+        satirlar.append(
+            f"  {t_lang('quality_log_internet', dil)}: "
+            f"{internet_text}"
+        )
+
+        targets = metrik.get("targets", {})
+
+        if targets:
+            hedefler = "  |  ".join(
+                f"{ad}: {deger:.1f}%"
+                for ad, deger in targets.items()
+            )
+
+            satirlar.append(
+                f"  {t_lang('quality_log_targets', dil)}: "
+                f"{hedefler}"
+            )
+
+    satirlar.append(
+        f"  {t_lang('log_likely_source', dil)}: "
+        f"{kalite_log_kaynagi(
+            metrik.get('source', 'unknown'),
+            dil
+        )}"
+    )
+
+    if olay == "stable" and baslangic is not None:
+        sure = max(
+            0,
+            (dt - baslangic).total_seconds()
+        )
+
+        satirlar.append(
+            f"  {t_lang('log_quality_duration', dil)}: "
+            f"{sure_yaz(sure, dil)}"
+        )
+
+    satirlar.append("-" * 72)
+
+    kalite_kayit_yaz(
+        "\n".join(satirlar),
+        dt
+    )
+
+
+def kalite_degerlendir(monotonic_now):
+    """
+    Kullanıcının seçtiği iki bağımsız kapsamı değerlendirir:
+
+    1) Yerel ağ: Bilgisayar ↔ otomatik tespit edilen ağ geçidi
+    2) İnternet/ISS yönü: Cloudflare + Google + Quad9
+
+    İki ölçüm birlikte açıksa sorunun başladığı tarafı ayırmak mümkün olur.
+    """
+    global kalite_durumu
+    global kalite_alarm_sayaci
+    global kalite_duzelme_sayaci
+    global kalite_unstable_baslangici
+    global kalite_unstable_kaynagi
+
+    local_enabled = settings.get(
+        "monitor_local_quality",
+        True
+    )
+    internet_enabled = settings.get(
+        "monitor_internet_quality",
+        True
+    )
+
+    if not local_enabled and not internet_enabled:
+        with kalite_lock:
+            kalite_durumu = "disabled"
+            kalite_alarm_sayaci = 0
+            kalite_duzelme_sayaci = 0
+
+        return {
+            "mode": "disabled",
+            "loss": None,
+            "ping": None,
+            "jitter": None,
+            "source": "unknown",
+            "gateway": kalite_gateway,
+            "gateway_loss": None,
+            "local_enabled": False,
+            "internet_enabled": False,
+            "local_loss": None,
+            "local_ping": None,
+            "local_jitter": None,
+            "internet_loss": None,
+            "internet_ping": None,
+            "internet_jitter": None,
+            "targets": {},
+        }, None
+
+    # -------------------------
+    # Yerel ağ ölçümü
+    # -------------------------
+    gateway_metric = None
+
+    if local_enabled and kalite_gateway:
+        gm = kalite_hedef_metrigi(
+            kalite_gateway,
+            monotonic_now
+        )
+
+        # Gateway tamamen ICMP engelliyorsa bunu yerel paket kaybı sayma.
+        # Ağ geçidi ICMP'yi tamamen engelliyorsa %100 loss diye
+        # yorumlamıyoruz; ölçüm kullanılamaz kabul ediyoruz.
+        if (
+            gm["sent"] >= KALITE_MIN_ORNEK
+            and gm["success"] >= 3
+        ):
+            gateway_metric = gm
+
+    # -------------------------
+    # İnternet / ISS ölçümü
+    # -------------------------
+    hedef_metrikleri = []
+
+    if internet_enabled:
+        for ad, ip in KALITE_HEDEFLERI.items():
+            m = kalite_hedef_metrigi(ip, monotonic_now)
+
+            # Sürekli ICMP engelleyen bir hedefi kalite kararı için kullanma.
+            # Tek bir internet hedefi ICMP rate-limit uygulayabilir.
+            # Bu nedenle yalnız cevap verebilen hedefleri kullanıyoruz.
+            if (
+                m["sent"] >= KALITE_MIN_ORNEK
+                and m["success"] >= 3
+            ):
+                hedef_metrikleri.append((ad, m))
+
+    local_loss = (
+        gateway_metric["loss"]
+        if gateway_metric is not None
+        else None
+    )
+    local_ping = (
+        gateway_metric["ping"]
+        if gateway_metric is not None
+        else None
+    )
+    local_jitter = (
+        gateway_metric["jitter"]
+        if gateway_metric is not None
+        else None
+    )
+
+    internet_losses = [
+        m["loss"]
+        for _, m in hedef_metrikleri
+        if m["loss"] is not None
+    ]
+    internet_pings = [
+        m["ping"]
+        for _, m in hedef_metrikleri
+        if m["ping"] is not None
+    ]
+    internet_jitters = [
+        m["jitter"]
+        for _, m in hedef_metrikleri
+        if m["jitter"] is not None
+    ]
+
+    internet_loss = (
+        statistics.median(internet_losses)
+        if internet_losses
+        else None
+    )
+    internet_ping = (
+        statistics.median(internet_pings)
+        if internet_pings
+        else None
+    )
+    internet_jitter = (
+        statistics.median(internet_jitters)
+        if internet_jitters
+        else None
+    )
+
+    # Henüz 60 saniyelik pencere için yeterli örnek birikmediyse
+    # kullanıcıya yalnızca ölçüm yapıldığını göster.
+    # Yeterli örnek birikmesini bekle.
+    local_ready = not local_enabled
+    internet_ready = not internet_enabled
+
+    if local_enabled and kalite_gateway:
+        local_sent = kalite_hedef_metrigi(
+            kalite_gateway,
+            monotonic_now
+        )["sent"]
+        local_ready = local_sent >= KALITE_MIN_ORNEK
+
+    if internet_enabled:
+        max_sent = 0
+
+        for ip in KALITE_HEDEFLERI.values():
+            max_sent = max(
+                max_sent,
+                kalite_hedef_metrigi(
+                    ip,
+                    monotonic_now
+                )["sent"]
+            )
+
+        internet_ready = max_sent >= KALITE_MIN_ORNEK
+
+    if not local_ready or not internet_ready:
+        return {
+            "mode": "warming",
+            "loss": None,
+            "ping": None,
+            "jitter": None,
+            "source": "unknown",
+            "gateway": kalite_gateway,
+            "gateway_loss": local_loss,
+            "local_enabled": local_enabled,
+            "internet_enabled": internet_enabled,
+            "local_loss": local_loss,
+            "local_ping": local_ping,
+            "local_jitter": local_jitter,
+            "internet_loss": internet_loss,
+            "internet_ping": internet_ping,
+            "internet_jitter": internet_jitter,
+            "targets": {},
+        }, None
+
+    # Seçili bir kapsam var ama o kapsamda güvenilir ICMP verisi yoksa
+    # "ölçüm kullanılamıyor" göster.
+    if local_enabled and gateway_metric is None:
+        local_available = False
+    else:
+        local_available = True
+
+    if internet_enabled and len(hedef_metrikleri) < 2:
+        internet_available = False
+    else:
+        internet_available = True
+
+    if (
+        (local_enabled and not local_available and not internet_enabled)
+        or
+        (internet_enabled and not internet_available and not local_enabled)
+        or
+        (
+            local_enabled
+            and internet_enabled
+            and not local_available
+            and not internet_available
+        )
+    ):
+        return {
+            "mode": "unavailable",
+            "loss": None,
+            "ping": None,
+            "jitter": None,
+            "source": "unknown",
+            "gateway": kalite_gateway,
+            "gateway_loss": local_loss,
+            "local_enabled": local_enabled,
+            "internet_enabled": internet_enabled,
+            "local_loss": local_loss,
+            "local_ping": local_ping,
+            "local_jitter": local_jitter,
+            "internet_loss": internet_loss,
+            "internet_ping": internet_ping,
+            "internet_jitter": internet_jitter,
+            "targets": {
+                ad: m["loss"]
+                for ad, m in hedef_metrikleri
+                if m["loss"] is not None
+            },
+        }, None
+
+    # -------------------------
+    # Sorun tespiti
+    # -------------------------
+    local_issue = (
+        local_enabled
+        and gateway_metric is not None
+        and local_loss is not None
+        and local_loss >= KALITE_KAYIP_ALARM_YUZDE
+        and gateway_metric["lost"] >= 1
+    )
+
+    problemli_internet_hedefi = sum(
+        1
+        for _, m in hedef_metrikleri
+        if (
+            m["loss"] is not None
+            and m["loss"] >= KALITE_KAYIP_ALARM_YUZDE
+            and m["lost"] >= 1
+        )
+    )
+
+    internet_issue = (
+        internet_enabled
+        and problemli_internet_hedefi >= 2
+    )
+
+    aday_unstable = local_issue or internet_issue
+
+    source = "healthy"
+
+    if local_issue:
+        # Gateway yönünde de kayıp varsa sorun yerel tarafta zaten
+        # gözlenebiliyor.
+        source = "local"
+
+    elif internet_issue:
+        if (
+            local_enabled
+            and gateway_metric is not None
+            and local_loss is not None
+            and local_loss <= KALITE_KAYIP_DUZELDI_YUZDE
+        ):
+            source = "isp"
+
+        elif not local_enabled:
+            # Yerel ölçüm kapalıyken dış hedeflerdeki kaybı doğrudan
+            # ISS'ye atfetmek doğru olmaz. Sadece internet yönünde
+            # kayıp olduğunu söyleriz.
+            source = "internet_only"
+
+        else:
+            source = "unknown"
+
+    # Arayüzde büyük metrikler internet ölçümü açıksa interneti,
+    # yalnız yerel ölçüm açıksa yerel ağı temsil eder.
+    if internet_enabled and internet_loss is not None:
+        display_loss = internet_loss
+        display_ping = internet_ping
+        display_jitter = internet_jitter
+    else:
+        display_loss = local_loss
+        display_ping = local_ping
+        display_jitter = local_jitter
+
+    metrik = {
+        "mode": "ready",
+        "loss": display_loss,
+        "ping": display_ping,
+        "jitter": display_jitter,
+        "source": source,
+        "gateway": kalite_gateway,
+        "gateway_loss": local_loss,
+        "local_enabled": local_enabled,
+        "internet_enabled": internet_enabled,
+        "local_loss": local_loss,
+        "local_ping": local_ping,
+        "local_jitter": local_jitter,
+        "internet_loss": internet_loss,
+        "internet_ping": internet_ping,
+        "internet_jitter": internet_jitter,
+        "targets": {
+            ad: m["loss"]
+            for ad, m in hedef_metrikleri
+            if m["loss"] is not None
+        },
+    }
+
+    transition = None
+
+    with kalite_lock:
+        if kalite_durumu != "unstable":
+            if aday_unstable:
+                kalite_alarm_sayaci += 1
+            else:
+                kalite_alarm_sayaci = 0
+
+            kalite_duzelme_sayaci = 0
+
+            if (
+                kalite_alarm_sayaci >= KALITE_ALARM_ONAY_DONGUSU
+                and internet_var is True
+            ):
+                kalite_durumu = "unstable"
+                kalite_alarm_sayaci = 0
+                kalite_unstable_baslangici = simdi()
+                kalite_unstable_kaynagi = source
+                transition = "unstable"
+
+        else:
+            # Yalnız açık olan kapsamların düzelmesini bekle.
+            local_healthy = (
+                not local_enabled
+                or local_loss is None
+                or local_loss <= KALITE_KAYIP_DUZELDI_YUZDE
+            )
+
+            internet_healthy = (
+                not internet_enabled
+                or internet_loss is None
+                or internet_loss <= KALITE_KAYIP_DUZELDI_YUZDE
+            )
+
+            iyilesmis = (
+                not aday_unstable
+                and local_healthy
+                and internet_healthy
+            )
+
+            if iyilesmis:
+                kalite_duzelme_sayaci += 1
+            else:
+                kalite_duzelme_sayaci = 0
+
+            if (
+                kalite_duzelme_sayaci >= KALITE_DUZELME_ONAY_DONGUSU
+                and internet_var is True
+            ):
+                kalite_durumu = "healthy"
+                kalite_duzelme_sayaci = 0
+                transition = "stable"
+
+    return metrik, transition
+
+
+def kalite_motoru(local_stop_event):
+    global kalite_gateway
+    global kalite_unstable_baslangici
+    global kalite_unstable_kaynagi
+
+    gateway_refresh_counter = 999
+
+    with ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="ConnectionCheckQuality"
+    ) as executor:
+
+        while not local_stop_event.is_set():
+            cycle_start = time.monotonic()
+
+            try:
+                local_enabled = settings.get(
+                    "monitor_local_quality",
+                    True
+                )
+                internet_enabled = settings.get(
+                    "monitor_internet_quality",
+                    True
+                )
+
+                # İki ölçüm de kapalıysa ICMP trafiği üretme.
+                if not local_enabled and not internet_enabled:
+                    metrik, _ = kalite_degerlendir(
+                        time.monotonic()
+                    )
+                    gui_cagir(
+                        kalite_metriklerini_guiye_uygula,
+                        metrik
+                    )
+
+                    local_stop_event.wait(
+                        KALITE_KONTROL_ARALIGI
+                    )
+                    continue
+
+                # Ağ geçidini yalnız yerel ağ ölçümü açıksa bul.
+                if local_enabled:
+                    gateway_refresh_counter += 1
+
+                    if gateway_refresh_counter >= 30:
+                        gateway_refresh_counter = 0
+                        yeni_gateway = varsayilan_gateway_bul()
+
+                        if yeni_gateway != kalite_gateway:
+                            with kalite_lock:
+                                kalite_gateway = yeni_gateway
+                                kalite_gecmisi.clear()
+
+                hedefler = []
+
+                if internet_enabled:
+                    hedefler.extend(
+                        KALITE_HEDEFLERI.values()
+                    )
+
+                if local_enabled and kalite_gateway:
+                    hedefler.append(kalite_gateway)
+
+                # Aynı IP'nin iki kez eklenmesini engelle.
+                hedefler = list(dict.fromkeys(hedefler))
+
+                if not hedefler:
+                    metrik, _ = kalite_degerlendir(
+                        time.monotonic()
+                    )
+                    gui_cagir(
+                        kalite_metriklerini_guiye_uygula,
+                        metrik
+                    )
+
+                    local_stop_event.wait(
+                        KALITE_KONTROL_ARALIGI
+                    )
+                    continue
+
+                futures = {
+                    executor.submit(
+                        icmp_ping,
+                        ip,
+                        KALITE_ICMP_TIMEOUT_MS
+                    ): ip
+                    for ip in hedefler
+                }
+
+                sonuclar = {}
+
+                for future in as_completed(futures):
+                    ip = futures[future]
+
+                    try:
+                        sonuclar[ip] = future.result()
+                    except Exception:
+                        sonuclar[ip] = (False, None)
+
+                now_mono = time.monotonic()
+
+                for ip in hedefler:
+                    basarili, rtt = sonuclar.get(
+                        ip,
+                        (False, None)
+                    )
+
+                    kalite_ornek_ekle(
+                        ip,
+                        basarili,
+                        rtt,
+                        now_mono
+                    )
+
+                metrik, transition = kalite_degerlendir(
+                    now_mono
+                )
+
+                gui_cagir(
+                    kalite_metriklerini_guiye_uygula,
+                    metrik
+                )
+
+                if transition == "unstable":
+                    dt = simdi()
+
+                    # Transition anındaki kaynak sınıflandırmasını loga taşı.
+                    kalite_olayi_yaz(
+                        "unstable",
+                        metrik,
+                        dt
+                    )
+
+                    gui_cagir(kalite_render)
+
+                elif transition == "stable":
+                    dt = simdi()
+                    baslangic = kalite_unstable_baslangici
+
+                    stable_log_metrik = dict(metrik)
+                    stable_log_metrik["source"] = (
+                        kalite_unstable_kaynagi
+                    )
+
+                    kalite_olayi_yaz(
+                        "stable",
+                        stable_log_metrik,
+                        dt,
+                        baslangic
+                    )
+
+                    with kalite_lock:
+                        kalite_unstable_baslangici = None
+                        kalite_unstable_kaynagi = "unknown"
+
+                    gui_cagir(kalite_render)
+
+            except Exception:
+                # Kalite modülü hata verse bile ana internet kesinti takibi
+                # çalışmaya devam eder.
+                pass
+
+            elapsed = time.monotonic() - cycle_start
+            bekleme = max(
+                0.1,
+                KALITE_KONTROL_ARALIGI - elapsed
+            )
+            local_stop_event.wait(bekleme)
 
 
 def gunluk_sayaci_sifirla():
@@ -1238,6 +2686,10 @@ def takip_motoru(local_stop_event):
                     internet_var = True
                     gelis_zamani = simdi()
 
+                    # Tam kesinti sonrası eski başarısız ICMP örnekleri yeni
+                    # bağlantı kalitesi kararını etkilemesin.
+                    kalite_gecmisini_sifirla("warming")
+
                     olay_dili = settings.get("language", "tr")
 
                     kayit_yaz(
@@ -1280,6 +2732,10 @@ def takip_motoru(local_stop_event):
                     internet_var = False
                     kesinti_baslangici = ilk_basarisizlik_zamani
 
+                    # Çevrimdışı durum ana durumdur. Kalite ölçümü tekrar
+                    # internet geldikten sonra temiz bir pencereyle başlar.
+                    kalite_gecmisini_sifirla("warming")
+
                     olay_dili = settings.get("language", "tr")
 
                     with log_state_lock:
@@ -1318,6 +2774,8 @@ def takibi_baslat():
     global takip_aktif
     global takip_thread
     global takip_stop_event
+    global kalite_thread
+    global kalite_stop_event
     global internet_var
     global basarisiz_kontrol
     global ilk_basarisizlik_zamani
@@ -1331,6 +2789,9 @@ def takibi_baslat():
     ilk_basarisizlik_zamani = None
 
     takip_stop_event = threading.Event()
+    kalite_stop_event = threading.Event()
+
+    kalite_gecmisini_sifirla("warming")
 
     takip_ayarla("active")
     durum_ayarla("checking")
@@ -1345,6 +2806,13 @@ def takibi_baslat():
     )
     takip_thread.start()
 
+    kalite_thread = threading.Thread(
+        target=kalite_motoru,
+        args=(kalite_stop_event,),
+        daemon=True
+    )
+    kalite_thread.start()
+
 
 def takibi_durdur():
     global takip_aktif
@@ -1355,7 +2823,11 @@ def takibi_durdur():
     if takip_stop_event is not None:
         takip_stop_event.set()
 
+    if kalite_stop_event is not None:
+        kalite_stop_event.set()
+
     takip_aktif = False
+    kalite_gecmisini_sifirla("paused")
 
     takip_ayarla("paused")
     durum_ayarla("paused")
@@ -1388,7 +2860,7 @@ def log_klasorunu_ac():
 def ayarlar_penceresi():
     pencere = tk.Toplevel(root)
     pencere.title(t("settings_title"))
-    pencere.geometry("555x380")
+    pencere.geometry("555x590")
     pencere.resizable(False, False)
     pencere.configure(bg=BG_MAIN)
 
@@ -1440,6 +2912,18 @@ def ayarlar_penceresi():
     )
     startup_var = tk.BooleanVar(
         value=settings["start_with_windows"]
+    )
+    monitor_local_quality_var = tk.BooleanVar(
+        value=settings.get(
+            "monitor_local_quality",
+            True
+        )
+    )
+    monitor_internet_quality_var = tk.BooleanVar(
+        value=settings.get(
+            "monitor_internet_quality",
+            True
+        )
     )
 
     def modern_checkbutton(parent, text, variable):
@@ -1499,6 +2983,98 @@ def ayarlar_penceresi():
         justify="left"
     ).pack(anchor="w", padx=(22, 0), pady=(0, 2))
 
+    quality_settings_card = tk.Frame(
+        wrapper,
+        bg=BG_CARD,
+        highlightthickness=1,
+        highlightbackground=BORDER,
+        bd=0
+    )
+    quality_settings_card.pack(fill="x", pady=(14, 0))
+
+    quality_settings_accent = tk.Frame(
+        quality_settings_card,
+        bg=ACCENT_AMBER,
+        height=2
+    )
+    quality_settings_accent.pack(fill="x")
+
+    quality_settings_inner = tk.Frame(
+        quality_settings_card,
+        bg=BG_CARD
+    )
+    quality_settings_inner.pack(
+        fill="x",
+        padx=18,
+        pady=13
+    )
+
+    tk.Label(
+        quality_settings_inner,
+        text=t("quality_settings_title"),
+        bg=BG_CARD,
+        fg=TEXT_MAIN,
+        font=(FONT, 11, "bold")
+    ).pack(anchor="w")
+
+    tk.Label(
+        quality_settings_inner,
+        text=t("quality_settings_desc"),
+        bg=BG_CARD,
+        fg=TEXT_MUTED,
+        font=(FONT, 9),
+        wraplength=465,
+        justify="left"
+    ).pack(anchor="w", pady=(3, 8))
+
+    local_quality_checkbox = modern_checkbutton(
+        quality_settings_inner,
+        t("monitor_local_quality"),
+        monitor_local_quality_var
+    )
+    local_quality_checkbox.pack(
+        anchor="w",
+        fill="x"
+    )
+
+    tk.Label(
+        quality_settings_inner,
+        text=t("monitor_local_quality_desc"),
+        bg=BG_CARD,
+        fg=TEXT_MUTED,
+        font=(FONT, 9),
+        wraplength=450,
+        justify="left"
+    ).pack(
+        anchor="w",
+        padx=(22, 0),
+        pady=(0, 5)
+    )
+
+    internet_quality_checkbox = modern_checkbutton(
+        quality_settings_inner,
+        t("monitor_internet_quality"),
+        monitor_internet_quality_var
+    )
+    internet_quality_checkbox.pack(
+        anchor="w",
+        fill="x"
+    )
+
+    tk.Label(
+        quality_settings_inner,
+        text=t("monitor_internet_quality_desc"),
+        bg=BG_CARD,
+        fg=TEXT_MUTED,
+        font=(FONT, 9),
+        wraplength=450,
+        justify="left"
+    ).pack(
+        anchor="w",
+        padx=(22, 0),
+        pady=(0, 1)
+    )
+
     buttons = tk.Frame(wrapper, bg=BG_MAIN)
     buttons.pack(fill="x", pady=(18, 0))
 
@@ -1508,7 +3084,23 @@ def ayarlar_penceresi():
         if windows_baslangic_ayarla(yeni_startup):
             settings["close_to_tray"] = close_to_tray_var.get()
             settings["start_with_windows"] = yeni_startup
+            settings["monitor_local_quality"] = (
+                monitor_local_quality_var.get()
+            )
+            settings["monitor_internet_quality"] = (
+                monitor_internet_quality_var.get()
+            )
             ayarlari_kaydet()
+
+            # Ölçüm kapsamı değiştiyse eski örnekler yeni kararları
+            # etkilemesin; kalite motoru yeni seçimleri bir sonraki
+            # döngüde otomatik olarak kullanır.
+            kalite_gecmisini_sifirla(
+                "warming"
+                if takip_aktif
+                else "paused"
+            )
+
             pencere.destroy()
 
     cancel_btn = PremiumButton(
@@ -1642,6 +3234,9 @@ def programdan_cik():
     if takip_stop_event is not None:
         takip_stop_event.set()
 
+    if kalite_stop_event is not None:
+        kalite_stop_event.set()
+
     try:
         if tray_icon is not None:
             tray_icon.stop()
@@ -1671,6 +3266,7 @@ def dili_degistir(dil):
     # Önceden kaydedilmiş olay satırları değiştirmez.
     try:
         dosya_hazirla(simdi())
+        kalite_dosya_hazirla(simdi())
     except Exception:
         pass
 
@@ -1916,6 +3512,142 @@ son_islem_label = tk.Label(
 )
 son_islem_label.pack(anchor="w", pady=(4, 0))
 
+# Bağlantı kalitesi kartı
+quality_card = tk.Frame(
+    ana_frame,
+    bg=BG_CARD_2,
+    highlightthickness=1,
+    highlightbackground=BORDER,
+    bd=0
+)
+quality_card.pack(fill="x", pady=(0, 14))
+
+quality_accent = tk.Frame(quality_card, bg=ACCENT_AMBER, height=2)
+quality_accent.pack(fill="x")
+
+quality_inner = tk.Frame(quality_card, bg=BG_CARD_2)
+quality_inner.pack(fill="x", padx=20, pady=(13, 14))
+
+quality_title_label = tk.Label(
+    quality_inner,
+    text="",
+    bg=BG_CARD_2,
+    fg="#a9bce0",
+    font=(FONT, 9, "bold")
+)
+quality_title_label.pack(anchor="w")
+
+quality_status_label = tk.Label(
+    quality_inner,
+    textvariable=kalite_status_var,
+    bg=BG_CARD_2,
+    fg=ACCENT_BLUE,
+    font=(FONT, 12, "bold"),
+    anchor="w",
+    justify="left"
+)
+quality_status_label.pack(fill="x", anchor="w", pady=(7, 1))
+
+quality_metrics = tk.Frame(quality_inner, bg=BG_CARD_2)
+quality_metrics.pack(fill="x", pady=(9, 5))
+
+quality_loss_box = tk.Frame(quality_metrics, bg=BG_CARD_2)
+quality_loss_box.pack(side="left", fill="x", expand=True)
+
+quality_loss_caption = tk.Label(
+    quality_loss_box,
+    text="",
+    bg=BG_CARD_2,
+    fg=TEXT_MUTED,
+    font=(FONT, 8)
+)
+quality_loss_caption.pack(anchor="w")
+
+tk.Label(
+    quality_loss_box,
+    textvariable=kalite_loss_var,
+    bg=BG_CARD_2,
+    fg=ACCENT_AMBER,
+    font=(FONT, 15, "bold")
+).pack(anchor="w", pady=(2, 0))
+
+quality_ping_box = tk.Frame(quality_metrics, bg=BG_CARD_2)
+quality_ping_box.pack(side="left", fill="x", expand=True)
+
+quality_ping_caption = tk.Label(
+    quality_ping_box,
+    text="",
+    bg=BG_CARD_2,
+    fg=TEXT_MUTED,
+    font=(FONT, 8)
+)
+quality_ping_caption.pack(anchor="w")
+
+tk.Label(
+    quality_ping_box,
+    textvariable=kalite_ping_var,
+    bg=BG_CARD_2,
+    fg=TEXT_MAIN,
+    font=(FONT, 15, "bold")
+).pack(anchor="w", pady=(2, 0))
+
+quality_jitter_box = tk.Frame(quality_metrics, bg=BG_CARD_2)
+quality_jitter_box.pack(side="left", fill="x", expand=True)
+
+quality_jitter_caption = tk.Label(
+    quality_jitter_box,
+    text="",
+    bg=BG_CARD_2,
+    fg=TEXT_MUTED,
+    font=(FONT, 8)
+)
+quality_jitter_caption.pack(anchor="w")
+
+tk.Label(
+    quality_jitter_box,
+    textvariable=kalite_jitter_var,
+    bg=BG_CARD_2,
+    fg=TEXT_MAIN,
+    font=(FONT, 15, "bold")
+).pack(anchor="w", pady=(2, 0))
+
+quality_source_label = tk.Label(
+    quality_inner,
+    textvariable=kalite_source_var,
+    bg=BG_CARD_2,
+    fg=TEXT_MAIN,
+    font=(FONT, 9, "bold"),
+    anchor="w",
+    justify="left"
+)
+quality_source_label.pack(fill="x", anchor="w", pady=(7, 0))
+
+quality_gateway_label = tk.Label(
+    quality_inner,
+    textvariable=kalite_gateway_var,
+    bg=BG_CARD_2,
+    fg=TEXT_DIM,
+    font=(FONT, 8),
+    anchor="w",
+    justify="left"
+)
+quality_gateway_label.pack(fill="x", anchor="w", pady=(4, 0))
+
+quality_internet_label = tk.Label(
+    quality_inner,
+    textvariable=kalite_internet_var,
+    bg=BG_CARD_2,
+    fg=TEXT_DIM,
+    font=(FONT, 8),
+    anchor="w",
+    justify="left"
+)
+quality_internet_label.pack(
+    fill="x",
+    anchor="w",
+    pady=(3, 0)
+)
+
 # İstatistik kartları
 stats_frame = tk.Frame(ana_frame, bg=BG_MAIN)
 stats_frame.pack(fill="x", pady=(0, 14))
@@ -2103,6 +3835,12 @@ def dili_uygula():
 
     status_title.config(text=t("connection_status"))
     son_islem_baslik.config(text=t("last_action"))
+
+    quality_title_label.config(text=t("quality_title"))
+    quality_loss_caption.config(text=t("packet_loss"))
+    quality_ping_caption.config(text=t("ping"))
+    quality_jitter_caption.config(text=t("jitter"))
+
     kesinti_baslik.config(text=t("today_outages"))
     takip_baslik.config(text=t("tracking_status"))
     log_baslik.config(text=t("log_folder"))
@@ -2117,6 +3855,7 @@ def dili_uygula():
     durum_render()
     takip_render()
     son_islem_render()
+    kalite_render()
 
 # G-SOFTWARE TARAFINDAN KODLANMIŞTIR. (www.g-software.org)
 # DEVELOPED BY G-SOFTWARE. (www.g-software.org)
